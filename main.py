@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from flask import Flask, request, Response
+import time
 
 app = Flask(__name__)
 
@@ -21,100 +22,86 @@ def ascii_from_image():
 
 	return Response(ascii_text, mimetype="text/plain")
 
-def xdog_filter(img, sigma=1.0, k=1.6, p=19.0, epsilon=0.1, phi=10.0):
-	if img is None:
-		raise FileNotFoundError("Could not open or find the image.")
+def xdog_filter(img, blur_sigma, simga_mult, edge_strength, threshold, sharpness):
 	img = img.astype(np.float32) / 255.0
 
-	blur1 = cv2.GaussianBlur(img, (0, 0), sigma)
-	blur2 = cv2.GaussianBlur(img, (0, 0), sigma * k)
+	blur1 = cv2.GaussianBlur(img, (0, 0), blur_sigma)
+	blur2 = cv2.GaussianBlur(img, (0, 0), blur_sigma * simga_mult)
 
-	xdog = (1.0 + p) * blur1 - p * blur2
+	xdog = (1.0 + edge_strength) * blur1 - edge_strength * blur2
+
+	mask = xdog < threshold
 
 	output = np.ones_like(xdog)
-
-	mask = xdog < epsilon
-
-
-	output[mask] = 1.0 + np.tanh(phi * (xdog[mask] - epsilon))
-
+	output[mask] = 1.0 + np.tanh(sharpness * (xdog[mask] - threshold))
 	output = (output > 0.5) * 1.0
-
 	output = (output * 255.0).astype(np.uint8)
 	return output
 
-def image_to_ascii(img):
-	result = xdog_filter(img, sigma=0.8, k = 1.7, p = 25.0, epsilon=0.08, phi=12.0)
-	sobeled_img_x = cv2.Sobel(result, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=3)
-	sobeled_img_y = cv2.Sobel(result, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=3)
+def image_to_ascii(img, block_size=8):
+	start_time = time.perf_counter()
+	
+	# xdog or extended difference of gaussians is being used as a preprocessing pass to make the sobel filter much clearer
+	xdoged_img = xdog_filter(img, blur_sigma=0.8,  sigma_mult=1.7, edge_strength=25.0, threshold=0.08, sharpness=12.0)
 
-	mag = cv2.magnitude(sobeled_img_x, sobeled_img_y)
-	grad = np.degrees(np.arctan2(sobeled_img_y, sobeled_img_x))
-	edge = (grad + 90) % 180
+	xdog_time = time.perf_counter()
 
-	h, w = mag.shape
+	# sobel gives us the 2D vector field of edge directions which we can use to determine the right edge character
+	sobeled_img_x = cv2.Sobel(xdoged_img, ddepth=cv2.CV_32F, dx=1, dy=0, ksize=3)
+	sobeled_img_y = cv2.Sobel(xdoged_img, ddepth=cv2.CV_32F, dx=0, dy=1, ksize=3)
 
-	h = h // 8
-	w = w // 8
+	sobel_time = time.perf_counter()
 
-	output = []
+	magnitudes = cv2.magnitude(sobeled_img_x, sobeled_img_y)
+	gradient = np.degrees(np.arctan2(sobeled_img_y, sobeled_img_x))
+	edge_angles = (gradient + 90) % 180
 
-	for y in range(h):
-		row_vals = []
+	h, w = magnitudes.shape
 
-		for x in range(w):
-			m = 0.0
+	ascii_rows = h // block_size
+	ascii_cols = w // block_size
+	crop_h = ascii_rows * block_size
+	crop_w = ascii_cols * block_size
 
-			vert = 0
-			horiz = 0
-			f_slash = 0
-			b_slash = 0
+	if ascii_rows == 0 or ascii_cols == 0:
+		return ""
 
-			lum = 0
+	img_crop = img[:crop_h, :crop_w]
+	mag_crop = magnitudes[:crop_h, :crop_w]
+	edge_crop = edge_angles[:crop_h, :crop_w]
 
-			for i in range(8):
-				for j in range(8):
-					lum += float(img[i + y * 8, j + x * 8])
-					m += mag[i + y * 8, j + x * 8]
-					e = edge[i + y * 8, j + x * 8]
-					
-					if e < 22.5 or e >= 157.5:
-						horiz += 1
-					elif e < 67.5:
-						b_slash += 1
-					elif e < 112.5:
-						vert += 1
-					else:
-						f_slash += 1
-		
-			m = m / 64.0
-			lum = lum / 64.0
+	block_shape = (ascii_rows, block_size, ascii_cols, block_size)
+	img_blocks = img_crop.reshape(block_shape)
+	mag_blocks = mag_crop.reshape(block_shape)
+	edge_blocks = edge_crop.reshape(block_shape)
 
-			if m < 300:
-				if lum < 50:
-					row_vals.append(' ')
-				elif lum < 100:
-					row_vals.append('.')
-				elif lum < 150:
-					row_vals.append('*')
-				elif lum < 200:
-					row_vals.append('#')
-				else:
-					row_vals.append('@')
-				continue
-			
-			best = max(vert, horiz, f_slash, b_slash)
-			if vert == best:
-				row_vals.append('|')
-			elif horiz == best:
-				row_vals.append('-')
-			elif f_slash == best:
-				row_vals.append('/')
-			else:
-				row_vals.append('\\')
+	lum = img_blocks.mean(axis=(1, 3))
+	avg_mag = mag_blocks.mean(axis=(1, 3))
 
-		output.append("".join(row_vals) + "\n")
-	return "".join(output)
+	horiz = ((edge_blocks < 22.5) | (edge_blocks >= 157.5)).sum(axis=(1, 3))
+	b_slash = ((edge_blocks >= 22.5) & (edge_blocks < 67.5)).sum(axis=(1, 3))
+	vert = ((edge_blocks >= 67.5) & (edge_blocks < 112.5)).sum(axis=(1, 3))
+	f_slash = ((edge_blocks >= 112.5) & (edge_blocks < 157.5)).sum(axis=(1, 3))
+
+	edge_scores = np.stack((vert, horiz, f_slash, b_slash), axis=0)
+	edge_chars = np.array(('|', '-', '/', '\\'))
+	ascii_grid = edge_chars[np.argmax(edge_scores, axis=0)]
+
+	lum_chars = np.select(
+		(lum < 50, lum < 100, lum < 150, lum < 200),
+		(' ', '.', '*', '#'),
+		default='@'
+	)
+	ascii_grid = np.where(avg_mag < 300, lum_chars, ascii_grid)
+
+	output = "".join("".join(row) + "\n" for row in ascii_grid)
+
+	ascii_time = time.perf_counter()
+	if app.debug:
+		print("xdog_time:", xdog_time - start_time)
+		print("sobel_time:", sobel_time - xdog_time)
+		print("ascii_time:", ascii_time - sobel_time)
+	return output
 
 if __name__ == "__main__":
 	app.run(debug=True)
